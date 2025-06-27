@@ -20,17 +20,64 @@ from llama_index.core import (
 )
 from llama_index.core.node_parser import SemanticSplitterNodeParser
 from llama_index.core.schema import TextNode
-# --- UPDATED: Import LlamaIndex's ChatMessage for type compatibility ---
 from llama_index.core.llms import ChatMessage as LlamaChatMessage
+
+# --- LlamaIndex LLM and Embedding Imports ---
 from llama_index.llms.ollama import Ollama
 from llama_index.embeddings.ollama import OllamaEmbedding
+# --- NEW: Import Gemini LLM ---
+# from llama_index.llms.gemini import Gemini
+from llama_index.llms.google_genai import GoogleGenAI
 
+
+def initialize_llm(provider, model_name, api_key=None):
+    """Initializes and returns the appropriate LLM based on the provider."""
+    if provider == "ollama":
+        print(f"Initializing Ollama with model: {model_name}")
+        return Ollama(model=model_name, request_timeout=180.0)
+    elif provider == "gemini":
+        # The Gemini model name is often passed in the constructor,
+        # and the API key is usually handled by environment variables.
+        # Ensure GOOGLE_API_KEY is set in your environment.
+        print(f"Initializing Gemini with model: {model_name}")
+        # Make sure the GOOGLE_API_KEY environment variable is set for Gemini
+        if not os.getenv("GOOGLE_API_KEY") and not api_key:
+             print("Warning: GOOGLE_API_KEY environment variable not set. Gemini may fail to initialize.", file=sys.stderr)
+        return GoogleGenAI(model=model_name, api_key=api_key, max_tokens=2048)
+    else:
+        raise ValueError(f"Unsupported LLM provider: {provider}")
+
+
+# --- 1. Argument Parsing (Moved to the top) ---
+# We need to parse arguments early to configure the settings.
+parser = argparse.ArgumentParser(description="Run the RAG system with configurable options.")
+parser.add_argument(
+    "--chat",
+    action="store_true",
+    help="Run in interactive chat mode in the terminal."
+)
+parser.add_argument(
+    "--llm-provider",
+    type=str,
+    default="ollama",
+    choices=["ollama", "gemini"],
+    help="The LLM provider to use."
+)
+parser.add_argument(
+    "--model-name",
+    type=str,
+    default="granite3.3:latest",
+    help="The name of the model to use (e.g., 'granite3.3:latest' for ollama, 'models/gemini-pro' for gemini)."
+)
+# Parse args here to use them in initial setup
+args = parser.parse_args()
+
+
+# --- 2. Global Settings and Configuration ---
 print("--- Starting RAG API Server with Hybrid Chunking Strategy ---")
-
-# --- 1. Global Settings and Configuration ---
 print("Configuring LlamaIndex settings...")
-Settings.embed_model = OllamaEmbedding(model_name="nomic-embed-text")
-Settings.llm = Ollama(model="granite3.3:latest", request_timeout=180.0)
+Settings.embed_model = OllamaEmbedding(model_name="nomic-embed-text") # Sticking with Ollama for embeddings for now
+Settings.llm = initialize_llm(args.llm_provider, args.model_name)
 
 # Define the semantic splitter for general use
 semantic_node_parser = SemanticSplitterNodeParser(
@@ -40,7 +87,7 @@ semantic_node_parser = SemanticSplitterNodeParser(
 print(f"SemanticSplitter is configured and will be used for non-FAQ files.")
 
 
-# --- 2. Load Documents and Build/Load the Index ---
+# --- 3. Load Documents and Build/Load the Index ---
 DATA_DIR = "./data"
 PERSIST_DIR = "./storage"
 
@@ -93,18 +140,16 @@ else:
         print(f"Error loading documents or building index: {e}", file=sys.stderr)
         sys.exit(1)
 
-# --- UPDATED: Load system prompt from an external file ---
+# --- Load system prompt from an external file ---
 try:
     with open("system_prompt.txt", 'r', encoding='utf-8') as f:
         system_prompt = f.read()
     print("System prompt loaded successfully from system_prompt.txt.")
 except FileNotFoundError:
     print("Warning: system_prompt.txt not found. Using a default prompt.", file=sys.stderr)
-    # Define a fallback prompt in case the file is missing
     system_prompt = "You are a helpful assistant." 
 
-
-# --- FIXED: Use `chat_mode='context'` which supports system_prompt ---
+# Use `chat_mode='context'` which supports system_prompt
 chat_engine = index.as_chat_engine(
     chat_mode="context", 
     verbose=False,
@@ -117,20 +162,20 @@ else:
     print("RAG chat engine could not be created.", file=sys.stderr)
 
 
-# --- 3. Define OpenAI-compatible Pydantic Models (for server mode) ---
-class ChatMessage(BaseModel):
+# --- 4. Define OpenAI-compatible Pydantic Models (for server mode) ---
+class PydanticChatMessage(BaseModel):
     role: Literal["user", "assistant", "system"]
     content: str
 
 class ChatCompletionRequest(BaseModel):
     model: str
-    messages: List[ChatMessage]
+    messages: List[PydanticChatMessage]
     temperature: Optional[float] = 0.1
     stream: Optional[bool] = False
 
 class ChatCompletionResponseChoice(BaseModel):
     index: int = 0
-    message: ChatMessage
+    message: PydanticChatMessage
     finish_reason: Literal["stop", "length"] = "stop"
 
 class ChatCompletionResponse(BaseModel):
@@ -141,7 +186,7 @@ class ChatCompletionResponse(BaseModel):
     choices: List[ChatCompletionResponseChoice]
 
 
-# --- 4. Create the FastAPI Application (for server mode) ---
+# --- 5. Create the FastAPI Application (for server mode) ---
 app = FastAPI()
 
 @app.get("/health", summary="Health Check")
@@ -168,42 +213,26 @@ def chat_completions(request: ChatCompletionRequest):
     if not request.messages:
         raise HTTPException(status_code=400, detail="No messages found in the request.")
 
-    # Convert Pydantic models to LlamaIndex's ChatMessage models
     all_messages = [LlamaChatMessage(role=msg.role, content=msg.content) for msg in request.messages]
     
-    # --- FIXED: Logic to handle stateful context engine in a stateless API ---
-    # The chat engine is stateful. To simulate a stateless API call, we
-    # temporarily replace its history for the duration of this request.
-    # This is NOT thread-safe and is only for single-user testing.
     original_history = chat_engine.chat_history
     try:
-        # Set the history from the incoming request
         chat_engine.chat_history = all_messages[:-1]
-        
         last_message_content = all_messages[-1].content
         print(f"[{datetime.now().isoformat()}] Received chat. History length: {len(chat_engine.chat_history)}, Query: '{last_message_content}'")
-        
-        # Chat with the last message
         response = chat_engine.chat(last_message_content)
-
     finally:
-        # Restore the original history to ensure this request doesn't
-        # leak state to the next one.
         chat_engine.chat_history = original_history
 
-    assistant_message = ChatMessage(role="assistant", content=str(response.response))
+    assistant_message = PydanticChatMessage(role="assistant", content=str(response.response))
     choice = ChatCompletionResponseChoice(message=assistant_message)
     response_payload = ChatCompletionResponse(choices=[choice])
     
     print(f"[{datetime.now().isoformat()}] Sending response: {response_payload.model_dump_json(indent=2)}")
     return response_payload
 
-# --- 5. Main Execution Block (with mode selection) ---
+# --- 6. Main Execution Block (with mode selection) ---
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Run the RAG system as a server or in interactive chat mode.")
-    parser.add_argument("--chat", action="store_true", help="Run in interactive chat mode in the terminal.")
-    args = parser.parse_args()
-
     if args.chat:
         # --- Run Interactive Chat Mode ---
         if not chat_engine:
@@ -213,7 +242,6 @@ if __name__ == "__main__":
         print("\n--- Starting Interactive Chat Mode ---")
         print("Type 'exit' or 'quit' to end the session. Type 'reset' to clear conversation history.")
         
-        # The stateful engine works perfectly in this interactive mode
         chat_engine.reset()
         
         while True:
