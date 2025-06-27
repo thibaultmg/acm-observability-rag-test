@@ -17,29 +17,26 @@ from llama_index.core import (
     load_index_from_storage,
     Settings,
 )
-# --- UPDATED: Import SemanticSplitterNodeParser ---
 from llama_index.core.node_parser import SemanticSplitterNodeParser
+# --- NEW: Import TextNode for custom node creation ---
+from llama_index.core.schema import TextNode
 from llama_index.llms.ollama import Ollama
 from llama_index.embeddings.ollama import OllamaEmbedding
 
-print("--- Starting RAG API Server with Chunk Inspection ---")
+print("--- Starting RAG API Server with Hybrid Chunking Strategy ---")
 
 # --- 1. Global Settings and Configuration ---
 print("Configuring LlamaIndex settings...")
 Settings.embed_model = OllamaEmbedding(model_name="nomic-embed-text")
-Settings.llm = Ollama(model="granite3.2:8b", request_timeout=180.0)
+Settings.llm = Ollama(model="granite3.3:latest", request_timeout=180.0)
 
-# --- UPDATED: Using a semantic chunker ---
-# SemanticSplitterNodeParser attempts to split text based on semantic meaning,
-# which can be more effective than fixed-size chunks. It uses the embedding model
-# to find semantic breakpoints.
-# breakpoint_percentile_threshold: Lower values create more, smaller chunks. Higher values create fewer, larger chunks.
-node_parser = SemanticSplitterNodeParser(
+# Define the semantic splitter for general use
+semantic_node_parser = SemanticSplitterNodeParser(
     embed_model=Settings.embed_model, 
     breakpoint_percentile_threshold=95
 )
-Settings.transformations = [node_parser]
-print(f"Using SemanticSplitterNodeParser with breakpoint_percentile_threshold={node_parser.breakpoint_percentile_threshold}")
+# We no longer set this globally in Settings.transformations, as we will apply it conditionally
+print(f"SemanticSplitter is configured and will be used for non-FAQ files.")
 
 
 # --- 2. Load Documents and Build/Load the Index ---
@@ -56,16 +53,47 @@ if os.path.exists(PERSIST_DIR):
     index = load_index_from_storage(storage_context)
     print("Index loaded successfully.")
 else:
-    print("Building new index from documents...")
+    print("Building new index with hybrid chunking strategy...")
     try:
-        documents = SimpleDirectoryReader(DATA_DIR).load_data()
-        if not documents:
-            print("No documents found in the data directory. The RAG system will only use the LLM's base knowledge.")
+        nodes = []
+        # --- NEW: Custom loading and parsing logic ---
+        for filename in os.listdir(DATA_DIR):
+            file_path = os.path.join(DATA_DIR, filename)
+            if not os.path.isfile(file_path):
+                continue
+
+            if filename.endswith("_faq.md"):
+                # --- Strategy 1: For FAQ files, split by '---' ---
+                print(f"Applying custom '---' splitter for: {filename}")
+                with open(file_path, 'r', encoding='utf-8') as f:
+                    content = f.read()
+                
+                chunks = content.split("\n---\n")
+                for i, chunk_text in enumerate(chunks):
+                    if chunk_text.strip(): # Avoid creating empty nodes
+                        node = TextNode(
+                            text=chunk_text.strip(),
+                            metadata={"file_name": filename, "chunk_number": i}
+                        )
+                        nodes.append(node)
+            else:
+                # --- Strategy 2: For all other files, use Semantic Splitter ---
+                print(f"Applying semantic splitter for: {filename}")
+                # Load the single document
+                documents = SimpleDirectoryReader(input_files=[file_path]).load_data()
+                # Use the semantic splitter to parse it into nodes
+                split_nodes = semantic_node_parser.get_nodes_from_documents(documents)
+                nodes.extend(split_nodes)
+
+        if not nodes:
+            print("No documents found or processed in the data directory. The RAG system will only use the LLM's base knowledge.")
             index = None
         else:
-            index = VectorStoreIndex.from_documents(documents)
+            # Create the index directly from our custom list of nodes
+            index = VectorStoreIndex(nodes)
             index.storage_context.persist(persist_dir=PERSIST_DIR)
             print(f"New index built and saved to {PERSIST_DIR}.")
+
     except Exception as e:
         print(f"Error loading documents or building index: {e}")
         print("Exiting. Please check your data folder and dependencies.")
@@ -111,7 +139,6 @@ def health_check():
     """Simple health check endpoint to confirm the server is running."""
     return {"status": "ok"}
 
-# --- UPDATED: Using the more direct .docs.values() method ---
 @app.get("/chunks", summary="Inspect Document Chunks")
 def get_chunks():
     """
@@ -121,7 +148,6 @@ def get_chunks():
     if not index:
          raise HTTPException(status_code=503, detail="Index is not available.")
     
-    # Use the more direct .docs.values() method to get all nodes.
     nodes = index.docstore.docs.values()
     
     if not nodes:
