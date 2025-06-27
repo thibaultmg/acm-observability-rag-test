@@ -93,11 +93,26 @@ else:
         print(f"Error loading documents or building index: {e}", file=sys.stderr)
         sys.exit(1)
 
-# --- UPDATED: Use a ChatEngine instead of a QueryEngine ---
-# A ChatEngine is designed for conversational, multi-turn interactions.
-chat_engine = index.as_chat_engine(chat_mode="condense_question", verbose=False) if index else None
+# --- UPDATED: Load system prompt from an external file ---
+try:
+    with open("system_prompt.txt", 'r', encoding='utf-8') as f:
+        system_prompt = f.read()
+    print("System prompt loaded successfully from system_prompt.txt.")
+except FileNotFoundError:
+    print("Warning: system_prompt.txt not found. Using a default prompt.", file=sys.stderr)
+    # Define a fallback prompt in case the file is missing
+    system_prompt = "You are a helpful assistant." 
+
+
+# --- FIXED: Use `chat_mode='context'` which supports system_prompt ---
+chat_engine = index.as_chat_engine(
+    chat_mode="context", 
+    verbose=False,
+    system_prompt=system_prompt
+) if index else None
+
 if chat_engine:
-    print("RAG chat engine is ready.")
+    print("RAG chat engine is ready with a custom system prompt.")
 else:
     print("RAG chat engine could not be created.", file=sys.stderr)
 
@@ -153,22 +168,29 @@ def chat_completions(request: ChatCompletionRequest):
     if not request.messages:
         raise HTTPException(status_code=400, detail="No messages found in the request.")
 
-    # --- UPDATED: Handle conversation history ---
     # Convert Pydantic models to LlamaIndex's ChatMessage models
     all_messages = [LlamaChatMessage(role=msg.role, content=msg.content) for msg in request.messages]
     
-    # Separate the last message from the history
-    last_message = all_messages[-1]
-    chat_history = all_messages[:-1]
-    
-    print(f"[{datetime.now().isoformat()}] Received chat. History length: {len(chat_history)}, Query: '{last_message.content}'")
+    # --- FIXED: Logic to handle stateful context engine in a stateless API ---
+    # The chat engine is stateful. To simulate a stateless API call, we
+    # temporarily replace its history for the duration of this request.
+    # This is NOT thread-safe and is only for single-user testing.
+    original_history = chat_engine.chat_history
+    try:
+        # Set the history from the incoming request
+        chat_engine.chat_history = all_messages[:-1]
+        
+        last_message_content = all_messages[-1].content
+        print(f"[{datetime.now().isoformat()}] Received chat. History length: {len(chat_engine.chat_history)}, Query: '{last_message_content}'")
+        
+        # Chat with the last message
+        response = chat_engine.chat(last_message_content)
 
-    # The chat engine's `chat` method can take a history.
-    # For a stateless API, we pass the history with each request.
-    # NOTE: The default ChatEngine is not thread-safe. For production, you'd need
-    # to manage engine instances per user/session.
-    response = chat_engine.chat(last_message.content, chat_history=chat_history)
-    
+    finally:
+        # Restore the original history to ensure this request doesn't
+        # leak state to the next one.
+        chat_engine.chat_history = original_history
+
     assistant_message = ChatMessage(role="assistant", content=str(response.response))
     choice = ChatCompletionResponseChoice(message=assistant_message)
     response_payload = ChatCompletionResponse(choices=[choice])
@@ -191,8 +213,7 @@ if __name__ == "__main__":
         print("\n--- Starting Interactive Chat Mode ---")
         print("Type 'exit' or 'quit' to end the session. Type 'reset' to clear conversation history.")
         
-        # In chat mode, the engine's internal memory provides statefulness.
-        # We reset it at the start of a new session.
+        # The stateful engine works perfectly in this interactive mode
         chat_engine.reset()
         
         while True:
@@ -211,9 +232,7 @@ if __name__ == "__main__":
                     continue
 
                 print("Bot: Thinking...")
-                # The chat engine automatically uses its internal memory
                 response = chat_engine.chat(user_message)
-                # The response object has a `.response` attribute with the text
                 print(f"\nBot: {response.response}")
 
             except KeyboardInterrupt:
