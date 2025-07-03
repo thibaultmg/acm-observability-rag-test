@@ -25,8 +25,7 @@ from llama_index.core.llms import ChatMessage as LlamaChatMessage
 # --- LlamaIndex LLM and Embedding Imports ---
 from llama_index.llms.ollama import Ollama
 from llama_index.embeddings.ollama import OllamaEmbedding
-# --- NEW: Import Gemini LLM ---
-# from llama_index.llms.gemini import Gemini
+# --- UPDATED: Import GoogleGenAI for Gemini models ---
 from llama_index.llms.google_genai import GoogleGenAI
 
 
@@ -34,7 +33,7 @@ def initialize_llm(provider, model_name, api_key=None):
     """Initializes and returns the appropriate LLM based on the provider."""
     if provider == "ollama":
         print(f"Initializing Ollama with model: {model_name}")
-        return Ollama(model=model_name, request_timeout=180.0)
+        return Ollama(model=model_name, request_timeout=180.0, temperature=0.1)
     elif provider == "gemini":
         # The Gemini model name is often passed in the constructor,
         # and the API key is usually handled by environment variables.
@@ -48,38 +47,43 @@ def initialize_llm(provider, model_name, api_key=None):
         raise ValueError(f"Unsupported LLM provider: {provider}")
 
 
-# --- 1. Argument Parsing (Moved to the top) ---
-# We need to parse arguments early to configure the settings.
+def log_retrieved_chunks(source_nodes, query):
+    """Logs the retrieved source nodes for a given query to a file."""
+    if not source_nodes:
+        return
+    
+    with open("retrieval.log", "a", encoding="utf-8") as f:
+        log_entry = f"--- Query: {query.strip()} ---\n"
+        log_entry += f"Timestamp: {datetime.now().isoformat()}\n"
+        log_entry += f"Retrieved {len(source_nodes)} chunks:\n\n"
+        
+        for i, node_with_score in enumerate(source_nodes):
+            node = node_with_score.node
+            score = node_with_score.score
+            log_entry += f"Chunk {i+1} (Score: {score:.4f}):\n"
+            log_entry += f"  Source: {node.metadata.get('file_name', 'N/A')}\n"
+            content = node.get_content().strip().replace('\n', ' ')
+            log_entry += f"  Content: {content}\n\n"
+        
+        log_entry += "=" * 40 + "\n\n"
+        f.write(log_entry)
+    print(f"Logged {len(source_nodes)} retrieved chunks to retrieval.log")
+
+
+# --- 1. Argument Parsing ---
 parser = argparse.ArgumentParser(description="Run the RAG system with configurable options.")
-parser.add_argument(
-    "--chat",
-    action="store_true",
-    help="Run in interactive chat mode in the terminal."
-)
-parser.add_argument(
-    "--llm-provider",
-    type=str,
-    default="ollama",
-    choices=["ollama", "gemini"],
-    help="The LLM provider to use."
-)
-parser.add_argument(
-    "--model-name",
-    type=str,
-    default="granite3.3:latest",
-    help="The name of the model to use (e.g., 'granite3.3:latest' for ollama, 'models/gemini-pro' for gemini)."
-)
-# Parse args here to use them in initial setup
+parser.add_argument("--chat", action="store_true", help="Run in interactive chat mode in the terminal.")
+parser.add_argument("--llm-provider", type=str, default="ollama", choices=["ollama", "gemini"], help="The LLM provider to use.")
+parser.add_argument("--model-name", type=str, default="granite3.3:latest", help="The name of the model to use (e.g., 'granite3.3:latest' for ollama, 'models/gemini-1.5-flash' for gemini).")
 args = parser.parse_args()
 
 
 # --- 2. Global Settings and Configuration ---
 print("--- Starting RAG API Server with Hybrid Chunking Strategy ---")
 print("Configuring LlamaIndex settings...")
-Settings.embed_model = OllamaEmbedding(model_name="nomic-embed-text") # Sticking with Ollama for embeddings for now
+Settings.embed_model = OllamaEmbedding(model_name="nomic-embed-text")
 Settings.llm = initialize_llm(args.llm_provider, args.model_name)
 
-# Define the semantic splitter for general use
 semantic_node_parser = SemanticSplitterNodeParser(
     embed_model=Settings.embed_model, 
     breakpoint_percentile_threshold=95
@@ -140,7 +144,6 @@ else:
         print(f"Error loading documents or building index: {e}", file=sys.stderr)
         sys.exit(1)
 
-# --- Load system prompt from an external file ---
 try:
     with open("system_prompt.txt", 'r', encoding='utf-8') as f:
         system_prompt = f.read()
@@ -149,11 +152,12 @@ except FileNotFoundError:
     print("Warning: system_prompt.txt not found. Using a default prompt.", file=sys.stderr)
     system_prompt = "You are a helpful assistant." 
 
-# Use `chat_mode='context'` which supports system_prompt
 chat_engine = index.as_chat_engine(
     chat_mode="context", 
     verbose=False,
-    system_prompt=system_prompt
+    system_prompt=system_prompt,
+    similarity_top_k=4,
+    similarity_cutoff=0.65
 ) if index else None
 
 if chat_engine:
@@ -163,19 +167,19 @@ else:
 
 
 # --- 4. Define OpenAI-compatible Pydantic Models (for server mode) ---
-class PydanticChatMessage(BaseModel):
+class APIChatMessage(BaseModel):
     role: Literal["user", "assistant", "system"]
     content: str
 
 class ChatCompletionRequest(BaseModel):
     model: str
-    messages: List[PydanticChatMessage]
+    messages: List[APIChatMessage]
     temperature: Optional[float] = 0.1
     stream: Optional[bool] = False
 
 class ChatCompletionResponseChoice(BaseModel):
     index: int = 0
-    message: PydanticChatMessage
+    message: APIChatMessage
     finish_reason: Literal["stop", "length"] = "stop"
 
 class ChatCompletionResponse(BaseModel):
@@ -221,10 +225,11 @@ def chat_completions(request: ChatCompletionRequest):
         last_message_content = all_messages[-1].content
         print(f"[{datetime.now().isoformat()}] Received chat. History length: {len(chat_engine.chat_history)}, Query: '{last_message_content}'")
         response = chat_engine.chat(last_message_content)
+        log_retrieved_chunks(response.source_nodes, last_message_content)
     finally:
         chat_engine.chat_history = original_history
 
-    assistant_message = PydanticChatMessage(role="assistant", content=str(response.response))
+    assistant_message = APIChatMessage(role="assistant", content=str(response.response))
     choice = ChatCompletionResponseChoice(message=assistant_message)
     response_payload = ChatCompletionResponse(choices=[choice])
     
@@ -234,7 +239,6 @@ def chat_completions(request: ChatCompletionRequest):
 # --- 6. Main Execution Block (with mode selection) ---
 if __name__ == "__main__":
     if args.chat:
-        # --- Run Interactive Chat Mode ---
         if not chat_engine:
             print("Chat engine not available. Exiting chat mode.", file=sys.stderr)
             sys.exit(1)
@@ -261,6 +265,7 @@ if __name__ == "__main__":
 
                 print("Bot: Thinking...")
                 response = chat_engine.chat(user_message)
+                log_retrieved_chunks(response.source_nodes, user_message)
                 print(f"\nBot: {response.response}")
 
             except KeyboardInterrupt:
@@ -269,11 +274,10 @@ if __name__ == "__main__":
             except Exception as e:
                 print(f"An error occurred: {e}", file=sys.stderr)
     else:
-        # --- Run Server Mode (Default) ---
         if not chat_engine:
             print("Chat engine not available. Cannot start server.", file=sys.stderr)
             sys.exit(1)
         print("Starting Uvicorn server at http://localhost:8000")
-        print("Access the API documentation at http://localhost:8000/docs")
+        print("Access the API documentation at http://localhost:8.0.0.0/docs")
         print("To inspect chunks, visit http://localhost:8000/chunks")
         uvicorn.run(app, host="0.0.0.0", port=8000)
