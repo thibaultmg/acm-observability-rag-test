@@ -20,12 +20,11 @@ from llama_index.core import (
 )
 from llama_index.core.node_parser import SemanticSplitterNodeParser
 from llama_index.core.schema import TextNode
-from llama_index.core.llms import ChatMessage as LlamaChatMessage
+from llama_index.core.llms import ChatMessage as LlamaChatMessage, LLM
 
 # --- LlamaIndex LLM and Embedding Imports ---
 from llama_index.llms.ollama import Ollama
 from llama_index.embeddings.ollama import OllamaEmbedding
-# --- UPDATED: Import GoogleGenAI for Gemini models ---
 from llama_index.llms.google_genai import GoogleGenAI
 
 
@@ -33,13 +32,9 @@ def initialize_llm(provider, model_name, api_key=None):
     """Initializes and returns the appropriate LLM based on the provider."""
     if provider == "ollama":
         print(f"Initializing Ollama with model: {model_name}")
-        return Ollama(model=model_name, request_timeout=180.0, temperature=0.1)
+        return Ollama(model=model_name, request_timeout=180.0)
     elif provider == "gemini":
-        # The Gemini model name is often passed in the constructor,
-        # and the API key is usually handled by environment variables.
-        # Ensure GOOGLE_API_KEY is set in your environment.
         print(f"Initializing Gemini with model: {model_name}")
-        # Make sure the GOOGLE_API_KEY environment variable is set for Gemini
         if not os.getenv("GOOGLE_API_KEY") and not api_key:
              print("Warning: GOOGLE_API_KEY environment variable not set. Gemini may fail to initialize.", file=sys.stderr)
         return GoogleGenAI(model=model_name, api_key=api_key, max_tokens=2048)
@@ -47,13 +42,15 @@ def initialize_llm(provider, model_name, api_key=None):
         raise ValueError(f"Unsupported LLM provider: {provider}")
 
 
-def log_retrieved_chunks(source_nodes, query):
+def log_retrieved_chunks(source_nodes, query, rewritten_query=None):
     """Logs the retrieved source nodes for a given query to a file."""
     if not source_nodes:
         return
     
     with open("retrieval.log", "a", encoding="utf-8") as f:
-        log_entry = f"--- Query: {query.strip()} ---\n"
+        log_entry = f"--- Original Query: {query.strip()} ---\n"
+        if rewritten_query:
+            log_entry += f"--- Rewritten Query: {rewritten_query.strip()} ---\n"
         log_entry += f"Timestamp: {datetime.now().isoformat()}\n"
         log_entry += f"Retrieved {len(source_nodes)} chunks:\n\n"
         
@@ -70,11 +67,58 @@ def log_retrieved_chunks(source_nodes, query):
     print(f"Logged {len(source_nodes)} retrieved chunks to retrieval.log")
 
 
+# --- NEW: Query Rewriting Logic ---
+QUERY_REWRITE_PROMPT_TMPL = """Given the following conversation history and a follow-up question,
+rephrase the follow-up question to be a standalone question that
+contains all the necessary context from the history.
+
+<Conversation History>
+{chat_history_str}
+
+<Follow-up Question>
+{question}
+
+<Standalone Question>
+"""
+
+def format_history(chat_history: List[LlamaChatMessage]) -> str:
+    """Helper to format chat history for the rewrite prompt."""
+    return "\n".join([f"{msg.role.capitalize()}: {msg.content}" for msg in chat_history])
+
+async def rewrite_query_async(llm: LLM, chat_history: List[LlamaChatMessage], question: str) -> str:
+    """Asynchronously rewrites a question using the chat history."""
+    if not chat_history:
+        return question
+
+    history_str = format_history(chat_history)
+    prompt = QUERY_REWRITE_PROMPT_TMPL.format(chat_history_str=history_str, question=question)
+    
+    response = await llm.acomplete(prompt)
+    rewritten_query = response.text.strip()
+    print(f"Original query: '{question}' -> Rewritten query: '{rewritten_query}'")
+    return rewritten_query
+
+def rewrite_query_sync(llm: LLM, chat_history: List[LlamaChatMessage], question: str) -> str:
+    """Synchronously rewrites a question using the chat history."""
+    if not chat_history:
+        return question
+
+    history_str = format_history(chat_history)
+    prompt = QUERY_REWRITE_PROMPT_TMPL.format(chat_history_str=history_str, question=question)
+
+    response = llm.complete(prompt)
+    rewritten_query = response.text.strip()
+    print(f"Original query: '{question}' -> Rewritten query: '{rewritten_query}'")
+    return rewritten_query
+
+
 # --- 1. Argument Parsing ---
 parser = argparse.ArgumentParser(description="Run the RAG system with configurable options.")
 parser.add_argument("--chat", action="store_true", help="Run in interactive chat mode in the terminal.")
 parser.add_argument("--llm-provider", type=str, default="ollama", choices=["ollama", "gemini"], help="The LLM provider to use.")
 parser.add_argument("--model-name", type=str, default="granite3.3:latest", help="The name of the model to use (e.g., 'granite3.3:latest' for ollama, 'models/gemini-1.5-flash' for gemini).")
+parser.add_argument("--similarity-top-k", type=int, default=4, help="The number of top similar chunks to retrieve.")
+parser.add_argument("--similarity-cutoff", type=float, default=0.7, help="The minimum similarity score for a chunk to be considered (0.0 to 1.0).")
 args = parser.parse_args()
 
 
@@ -152,18 +196,19 @@ except FileNotFoundError:
     print("Warning: system_prompt.txt not found. Using a default prompt.", file=sys.stderr)
     system_prompt = "You are a helpful assistant." 
 
-chat_engine = index.as_chat_engine(
-    chat_mode="context", 
-    verbose=False,
-    system_prompt=system_prompt,
-    similarity_top_k=4,
-    similarity_cutoff=0.65
-) if index else None
-
-if chat_engine:
-    print("RAG chat engine is ready with a custom system prompt.")
+if index:
+    retriever = index.as_retriever(
+        similarity_top_k=args.similarity_top_k,
+        similarity_cutoff=args.similarity_cutoff
+    )
+    print(f"Retriever configured with top_k={args.similarity_top_k} and cutoff={args.similarity_cutoff}")
 else:
-    print("RAG chat engine could not be created.", file=sys.stderr)
+    retriever = None
+
+if retriever:
+    print("RAG system is ready.")
+else:
+    print("RAG system could not be initialized.", file=sys.stderr)
 
 
 # --- 4. Define OpenAI-compatible Pydantic Models (for server mode) ---
@@ -210,26 +255,36 @@ def get_chunks():
     return Response(content=json.dumps(chunks_data, indent=2), media_type="application/json")
 
 @app.post("/v1/chat/completions", response_model=ChatCompletionResponse, summary="OpenAI-compatible Chat Endpoint")
-def chat_completions(request: ChatCompletionRequest):
-    if not chat_engine:
-        raise HTTPException(status_code=503, detail="RAG chat engine is not available.")
+async def chat_completions(request: ChatCompletionRequest):
+    if not retriever:
+        raise HTTPException(status_code=503, detail="RAG retriever is not available.")
     
     if not request.messages:
         raise HTTPException(status_code=400, detail="No messages found in the request.")
 
     all_messages = [LlamaChatMessage(role=msg.role, content=msg.content) for msg in request.messages]
-    
-    original_history = chat_engine.chat_history
-    try:
-        chat_engine.chat_history = all_messages[:-1]
-        last_message_content = all_messages[-1].content
-        print(f"[{datetime.now().isoformat()}] Received chat. History length: {len(chat_engine.chat_history)}, Query: '{last_message_content}'")
-        response = chat_engine.chat(last_message_content)
-        log_retrieved_chunks(response.source_nodes, last_message_content)
-    finally:
-        chat_engine.chat_history = original_history
+    chat_history = all_messages[:-1]
+    last_message_content = all_messages[-1].content
 
-    assistant_message = APIChatMessage(role="assistant", content=str(response.response))
+    # --- UPDATED: Implement query rewriting flow ---
+    # 1. Rewrite the query to be a standalone question
+    rewritten_query = await rewrite_query_async(Settings.llm, chat_history, last_message_content)
+    
+    # 2. Retrieve context using the rewritten query
+    retrieved_nodes = await retriever.aretrieve(rewritten_query)
+    log_retrieved_chunks(retrieved_nodes, last_message_content, rewritten_query)
+    
+    # 3. Generate a response using the original history and new context
+    context_str = "\n\n".join([n.get_content() for n in retrieved_nodes])
+    final_messages_for_llm = [
+        LlamaChatMessage(role="system", content=system_prompt),
+        *chat_history,
+        LlamaChatMessage(role="user", content=f"Given the following context, answer the user's question.\n<Context>\n{context_str}\n</Context>\nUser Question: {last_message_content}")
+    ]
+    
+    response = await Settings.llm.achat(final_messages_for_llm)
+    
+    assistant_message = APIChatMessage(role="assistant", content=str(response.message.content))
     choice = ChatCompletionResponseChoice(message=assistant_message)
     response_payload = ChatCompletionResponse(choices=[choice])
     
@@ -239,14 +294,14 @@ def chat_completions(request: ChatCompletionRequest):
 # --- 6. Main Execution Block (with mode selection) ---
 if __name__ == "__main__":
     if args.chat:
-        if not chat_engine:
-            print("Chat engine not available. Exiting chat mode.", file=sys.stderr)
+        if not retriever:
+            print("Retriever not available. Exiting chat mode.", file=sys.stderr)
             sys.exit(1)
             
         print("\n--- Starting Interactive Chat Mode ---")
         print("Type 'exit' or 'quit' to end the session. Type 'reset' to clear conversation history.")
         
-        chat_engine.reset()
+        chat_history = []
         
         while True:
             try:
@@ -256,7 +311,7 @@ if __name__ == "__main__":
                     break
                 
                 if user_message.lower() == "reset":
-                    chat_engine.reset()
+                    chat_history = []
                     print("...Conversation history has been reset...")
                     continue
 
@@ -264,9 +319,31 @@ if __name__ == "__main__":
                     continue
 
                 print("Bot: Thinking...")
-                response = chat_engine.chat(user_message)
-                log_retrieved_chunks(response.source_nodes, user_message)
-                print(f"\nBot: {response.response}")
+                
+                # --- UPDATED: Implement query rewriting flow for interactive mode ---
+                # 1. Rewrite query
+                rewritten_query = rewrite_query_sync(Settings.llm, chat_history, user_message)
+                
+                # 2. Retrieve context
+                retrieved_nodes = retriever.retrieve(rewritten_query)
+                log_retrieved_chunks(retrieved_nodes, user_message, rewritten_query)
+                
+                # 3. Generate response
+                context_str = "\n\n".join([n.get_content() for n in retrieved_nodes])
+                final_messages_for_llm = [
+                    LlamaChatMessage(role="system", content=system_prompt),
+                    *chat_history,
+                    LlamaChatMessage(role="user", content=f"Given the following context, answer the user's question.\n<Context>\n{context_str}\n</Context>\nUser Question: {user_message}")
+                ]
+                
+                response = Settings.llm.chat(final_messages_for_llm)
+                response_content = response.message.content
+                
+                print(f"\nBot: {response_content}")
+                
+                # 4. Update history
+                chat_history.append(LlamaChatMessage(role="user", content=user_message))
+                chat_history.append(LlamaChatMessage(role="assistant", content=response_content))
 
             except KeyboardInterrupt:
                 print("\nExiting chat mode. Goodbye!")
@@ -274,10 +351,10 @@ if __name__ == "__main__":
             except Exception as e:
                 print(f"An error occurred: {e}", file=sys.stderr)
     else:
-        if not chat_engine:
-            print("Chat engine not available. Cannot start server.", file=sys.stderr)
+        if not retriever:
+            print("Retriever not available. Cannot start server.", file=sys.stderr)
             sys.exit(1)
         print("Starting Uvicorn server at http://localhost:8000")
-        print("Access the API documentation at http://localhost:8.0.0.0/docs")
+        print("Access the API documentation at http://localhost:8000/docs")
         print("To inspect chunks, visit http://localhost:8000/chunks")
         uvicorn.run(app, host="0.0.0.0", port=8000)
