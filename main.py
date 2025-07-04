@@ -67,15 +67,19 @@ def log_retrieved_chunks(source_nodes, query, rewritten_query=None):
     print(f"Logged {len(source_nodes)} retrieved chunks to retrieval.log")
 
 
-# --- NEW: Query Rewriting Logic ---
-QUERY_REWRITE_PROMPT_TMPL = """Given the following conversation history and a follow-up question,
-rephrase the follow-up question to be a standalone question that
-contains all the necessary context from the history.
+# --- UPDATED: Query Rewriting Logic ---
+QUERY_REWRITE_PROMPT_TMPL = """You are an expert assistant who rewrites a user's question to be a standalone question.
+Your goal is to rephrase the question to include all necessary context from the chat history and product description.
+Use precise terminology from the product description to optimize retrieval in a RAG system.
+Do not answer the question. Only provide the rephrased, standalone question.
+
+<Product Description>
+{product_description}
 
 <Conversation History>
 {chat_history_str}
 
-<Follow-up Question>
+<User Question>
 {question}
 
 <Standalone Question>
@@ -83,28 +87,32 @@ contains all the necessary context from the history.
 
 def format_history(chat_history: List[LlamaChatMessage]) -> str:
     """Helper to format chat history for the rewrite prompt."""
+    if not chat_history:
+        return "No history yet."
     return "\n".join([f"{msg.role.capitalize()}: {msg.content}" for msg in chat_history])
 
-async def rewrite_query_async(llm: LLM, chat_history: List[LlamaChatMessage], question: str) -> str:
-    """Asynchronously rewrites a question using the chat history."""
-    if not chat_history:
-        return question
-
+async def rewrite_query_async(llm: LLM, chat_history: List[LlamaChatMessage], question: str, product_description: str) -> str:
+    """Asynchronously rewrites a question using the chat history and product description."""
     history_str = format_history(chat_history)
-    prompt = QUERY_REWRITE_PROMPT_TMPL.format(chat_history_str=history_str, question=question)
+    prompt = QUERY_REWRITE_PROMPT_TMPL.format(
+        product_description=product_description,
+        chat_history_str=history_str,
+        question=question
+    )
     
     response = await llm.acomplete(prompt)
     rewritten_query = response.text.strip()
     print(f"Original query: '{question}' -> Rewritten query: '{rewritten_query}'")
     return rewritten_query
 
-def rewrite_query_sync(llm: LLM, chat_history: List[LlamaChatMessage], question: str) -> str:
-    """Synchronously rewrites a question using the chat history."""
-    if not chat_history:
-        return question
-
+def rewrite_query_sync(llm: LLM, chat_history: List[LlamaChatMessage], question: str, product_description: str) -> str:
+    """Synchronously rewrites a question using the chat history and product description."""
     history_str = format_history(chat_history)
-    prompt = QUERY_REWRITE_PROMPT_TMPL.format(chat_history_str=history_str, question=question)
+    prompt = QUERY_REWRITE_PROMPT_TMPL.format(
+        product_description=product_description,
+        chat_history_str=history_str,
+        question=question
+    )
 
     response = llm.complete(prompt)
     rewritten_query = response.text.strip()
@@ -188,6 +196,7 @@ else:
         print(f"Error loading documents or building index: {e}", file=sys.stderr)
         sys.exit(1)
 
+# --- UPDATED: Load separate system prompt and product description ---
 try:
     with open("system_prompt.txt", 'r', encoding='utf-8') as f:
         system_prompt = f.read()
@@ -195,6 +204,14 @@ try:
 except FileNotFoundError:
     print("Warning: system_prompt.txt not found. Using a default prompt.", file=sys.stderr)
     system_prompt = "You are a helpful assistant." 
+
+try:
+    with open("product_description.txt", 'r', encoding='utf-8') as f:
+        product_description = f.read()
+    print("Product description loaded successfully from product_description.txt.")
+except FileNotFoundError:
+    print("Warning: product_description.txt not found. Using an empty description.", file=sys.stderr)
+    product_description = "No product description provided."
 
 if index:
     retriever = index.as_retriever(
@@ -268,7 +285,7 @@ async def chat_completions(request: ChatCompletionRequest):
 
     # --- UPDATED: Implement query rewriting flow ---
     # 1. Rewrite the query to be a standalone question
-    rewritten_query = await rewrite_query_async(Settings.llm, chat_history, last_message_content)
+    rewritten_query = await rewrite_query_async(Settings.llm, chat_history, last_message_content, product_description)
     
     # 2. Retrieve context using the rewritten query
     retrieved_nodes = await retriever.aretrieve(rewritten_query)
@@ -322,7 +339,7 @@ if __name__ == "__main__":
                 
                 # --- UPDATED: Implement query rewriting flow for interactive mode ---
                 # 1. Rewrite query
-                rewritten_query = rewrite_query_sync(Settings.llm, chat_history, user_message)
+                rewritten_query = rewrite_query_sync(Settings.llm, chat_history, user_message, product_description)
                 
                 # 2. Retrieve context
                 retrieved_nodes = retriever.retrieve(rewritten_query)
