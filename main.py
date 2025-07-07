@@ -2,7 +2,7 @@
 import os
 import sys
 import argparse
-import yaml # NEW: Import YAML library
+import yaml
 from datetime import datetime
 from typing import List, Optional, Any, Sequence
 
@@ -93,6 +93,23 @@ Do not answer the question. Only provide the rephrased, standalone question.
 <Standalone Question>
 """
 
+FOLLOW_UP_PROMPT_TMPL = """Based on the provided context and the last answer, generate three concise and relevant follow-up questions that a user might ask next.
+Return the questions as a numbered list, for example:
+1. First question?
+2. Second question?
+3. Third question?
+
+<Context>
+{context_str}
+</Context>
+
+<Last Answer>
+{answer}
+</Last Answer>
+
+<Follow-up Questions>
+"""
+
 def format_history(chat_history: List[LlamaChatMessage]) -> str:
     if not chat_history: return "No history yet."
     return "\n".join([f"{msg.role.capitalize()}: {msg.content}" for msg in chat_history])
@@ -105,9 +122,22 @@ def rewrite_query_sync(llm: CustomLLM, chat_history: List[LlamaChatMessage], que
     print(f"Original query: '{question}' -> Rewritten query: '{rewritten_query}'")
     return rewritten_query
 
-# --- NEW: Configuration Loading ---
+def generate_follow_ups_sync(llm: CustomLLM, context: str, answer: str) -> List[str]:
+    prompt = FOLLOW_UP_PROMPT_TMPL.format(context_str=context, answer=answer)
+    response = llm.complete(prompt)
+    
+    questions = []
+    for line in response.text.strip().split('\n'):
+        if line.strip():
+            parts = line.split('.', 1)
+            if len(parts) > 1 and parts[0].isdigit():
+                questions.append(parts[1].strip())
+            else:
+                questions.append(line.strip())
+    return questions[:3]
+
+# --- Configuration Loading ---
 def load_config():
-    """Loads configuration from config.yaml and allows environment variable overrides."""
     try:
         with open("config.yaml", 'r') as f:
             config = yaml.safe_load(f)
@@ -115,8 +145,6 @@ def load_config():
         print("Warning: config.yaml not found or invalid. Using empty config.", file=sys.stderr)
         config = {}
 
-    # Allow environment variables to override config file settings
-    # This is crucial for containerized deployments
     config.setdefault("llm_config", {})
     config.setdefault("embedding_config", {})
     config.setdefault("retriever_config", {})
@@ -132,12 +160,10 @@ config = load_config()
 
 @cl.on_chat_start
 async def on_chat_start():
-    """Initializes all components when a new chat session starts."""
     llm_config = config.get("llm_config", {})
     embedding_config = config.get("embedding_config", {})
     retriever_config = config.get("retriever_config", {})
 
-    # Initialize models
     rewrite_llm = LiteLLMWrapper(model=llm_config.get("rewrite_model", "ollama/mistral"))
     answer_llm = LiteLLMWrapper(model=llm_config.get("answer_model", "ollama/mistral"))
     embed_model = OllamaEmbedding(
@@ -150,7 +176,6 @@ async def on_chat_start():
     print(f"Answer LLM: {answer_llm.model}")
     print(f"Embedding Model: {embed_model.model_name} at {embed_model.base_url}")
 
-    # Load prompts
     try:
         with open("system_prompt.txt", 'r') as f: system_prompt = f.read()
     except FileNotFoundError: system_prompt = "You are a helpful assistant." 
@@ -159,7 +184,6 @@ async def on_chat_start():
         with open("product_description.txt", 'r') as f: product_description = f.read()
     except FileNotFoundError: product_description = "No product description provided."
 
-    # Load vector index
     DATA_DIR, PERSIST_DIR = "./data", "./storage"
     if os.path.exists(PERSIST_DIR):
         storage_context = StorageContext.from_defaults(persist_dir=PERSIST_DIR)
@@ -168,13 +192,11 @@ async def on_chat_start():
         await cl.Message(content="Vector store not found. Please run `make data` and ensure the store is built before starting.").send()
         return
 
-    # Create retriever
     retriever = index.as_retriever(
         similarity_top_k=int(retriever_config.get("similarity_top_k", 4)),
         similarity_cutoff=float(retriever_config.get("similarity_cutoff", 0.7))
     )
 
-    # Store components in the user session
     cl.user_session.set("rewrite_llm", rewrite_llm)
     cl.user_session.set("answer_llm", answer_llm)
     cl.user_session.set("retriever", retriever)
@@ -186,7 +208,6 @@ async def on_chat_start():
 
 @cl.on_message
 async def on_message(message: cl.Message):
-    """Handles incoming messages from the user."""
     rewrite_llm = cl.user_session.get("rewrite_llm")
     answer_llm = cl.user_session.get("answer_llm")
     retriever = cl.user_session.get("retriever")
@@ -215,9 +236,31 @@ async def on_message(message: cl.Message):
     msg.content = response.text
     await msg.update()
 
+    # --- Generate and display follow-up questions ---
+    follow_up_questions = generate_follow_ups_sync(rewrite_llm, context_str, response.text)
+    if follow_up_questions:
+        # --- FIXED: Store the question in the payload for the callback ---
+        actions = [
+            cl.Action(name="follow_up", value=q, label=q, payload={"content": q}) for q in follow_up_questions
+        ]
+        await cl.Message(
+            content="Here are some suggested follow-ups:",
+            actions=actions,
+            author="System"
+        ).send()
+
     cl_messages.append(cl.Message(author="user", content=message.content))
     cl_messages.append(cl.Message(author="assistant", content=response.text))
     cl.user_session.set("chat_history", cl_messages)
+
+# --- Add an action callback to handle button clicks ---
+@cl.action_callback("follow_up")
+async def on_action(action: cl.Action):
+    """Handles the 'follow_up' action button clicks."""
+    # --- FIXED: Retrieve the question from the action's payload ---
+    question_content = action.payload.get("content")
+    if question_content:
+        await on_message(cl.Message(content=question_content))
 
 # --- Terminal Chat Mode Logic ---
 def run_terminal_chat():
