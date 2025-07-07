@@ -1,0 +1,24 @@
+# config.yaml
+
+# Configuration for the Language Models used in the RAG pipeline
+llm_config:
+  # Model for rewriting user questions (can be a smaller, faster model)
+  rewrite_model: "gemini/gemini-2.5-flash-lite-preview-06-17"
+  # Model for generating the final answer (can be a larger, more powerful model)
+  answer_model: "gemini/gemini-2.5-flash"
+
+# Configuration for the retriever
+retriever_config:
+  # Number of top similar chunks to retrieve from the vector store
+  similarity_top_k: 4
+  # Minimum similarity score for a chunk to be considered (0.0 to 1.0)
+  similarity_cutoff: 0.7
+
+# Configuration for the embedding model
+embedding_config:
+  # The model used to create vector embeddings for documents and queries
+  model_name: "nomic-embed-text"
+  # The host for the Ollama server.
+  # This can be overridden by the OLLAMA_HOST environment variable.
+  ollama_host: "http://localhost:11434"
+
