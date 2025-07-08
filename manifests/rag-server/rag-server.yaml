@@ -1,0 +1,84 @@
+# acm-obs-rag-server-deployment.yaml
+# ---
+# Note: Before applying this manifest, you must create a secret in your
+# OpenShift project to hold your API keys. For example:
+#
+# oc create secret generic litellm-api-keys \
+#   --from-literal=GOOGLE_API_KEY='your-google-api-key' \
+#   --from-literal=OPENAI_API_KEY='your-openai-api-key'
+# ---
+apiVersion: apps/v1
+kind: StatefulSet # UPDATED: Changed from Deployment to StatefulSet for persistent storage
+metadata:
+  name: acm-obs-rag-server
+  labels:
+    app: acm-obs-rag-server
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: acm-obs-rag-server
+  serviceName: "acm-obs-rag-server-service" # Required for StatefulSets
+  template:
+    metadata:
+      labels:
+        app: acm-obs-rag-server
+    spec:
+      containers:
+      - name: acm-obs-rag-server
+        image: quay.io/rh-ee-tmange/acm-observability-expert:latest # Replace with your actual image path
+        ports:
+        - containerPort: 8000
+        command: ["python", "main.py"]
+        args:
+        - "--ollama-host"
+        - "http://ollama-service:11434"
+        # --- NEW: Mount for the persistent vector store ---
+        volumeMounts:
+        - name: rag-storage
+          mountPath: /app/storage
+        env:
+        - name: GOOGLE_API_KEY
+          valueFrom:
+            secretKeyRef:
+              name: litellm-api-keys
+              key: GOOGLE_API_KEY
+              optional: true
+  volumeClaimTemplates:
+  - metadata:
+      name: rag-storage
+    spec:
+      accessModes: [ "ReadWriteOnce" ]
+      resources:
+        requests:
+          storage: 5Gi # Adjust as needed for your index size
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: acm-obs-rag-server-service
+  labels:
+    app: acm-obs-rag-server
+spec:
+  ports:
+  - port: 8000
+    targetPort: 8000
+  selector:
+    app: acm-obs-rag-server
+---
+apiVersion: route.openshift.io/v1
+kind: Route
+metadata:
+  name: acm-obs-rag-server-route
+  labels:
+    app: acm-obs-rag-server
+spec:
+  to:
+    kind: Service
+    name: acm-obs-rag-server-service # The name of the service that fronts your app
+  subdomain: acm-observability-assistant
+  port:
+    targetPort: 8000 # The port your service is listening on
+  tls:
+    termination: edge
+    insecureEdgeTerminationPolicy: Redirect # Redirects HTTP requests to HTTPS

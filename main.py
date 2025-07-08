@@ -28,8 +28,10 @@ from llama_index.core import (
 from llama_index.core.node_parser import SemanticSplitterNodeParser, MarkdownNodeParser
 from llama_index.core.schema import TextNode, NodeWithScore
 from llama_index.embeddings.ollama import OllamaEmbedding
-from llama_index.core.postprocessor import SentenceTransformerRerank
-from llama_index.core.postprocessor import SimilarityPostprocessor
+from llama_index.core.postprocessor import SentenceTransformerRerank, SimilarityPostprocessor
+# --- FIXED: Corrected import path for FusionRetriever ---
+from llama_index.core.retrievers import VectorIndexRetriever, QueryFusionRetriever
+from llama_index.retrievers.bm25 import BM25Retriever
 
 
 # --- Custom LLM Wrapper for LiteLLM ---
@@ -145,7 +147,7 @@ async def on_chat_start():
     )
     
     reranker = SentenceTransformerRerank(
-        model="BAAI/bge-reranker-base", top_n=int(retriever_config.get("rerank_top_n", 4))
+        model="BAAI/bge-reranker-base", top_n=int(retriever_config.get("rerank_top_n", 5))
     )
     score_filter = SimilarityPostprocessor(
         similarity_cutoff=float(retriever_config.get("similarity_cutoff", 0.7))
@@ -172,13 +174,11 @@ async def on_chat_start():
             file_path = os.path.join(DATA_DIR, filename)
             if not os.path.isfile(file_path): continue
             if filename.endswith("_faq.md"):
-                print(f"Applying custom '---' splitter for: {filename}")
                 with open(file_path, 'r', encoding='utf-8') as f: content = f.read()
                 chunks = content.split("\n---\n")
                 for i, chunk_text in enumerate(chunks):
                     if chunk_text.strip(): nodes.append(TextNode(text=chunk_text.strip(), metadata={"file_name": filename}))
             elif filename.endswith(".md"):
-                print(f"Applying Markdown parser for: {filename}")
                 documents = SimpleDirectoryReader(input_files=[file_path]).load_data()
                 nodes.extend(markdown_parser.get_nodes_from_documents(documents))
         
@@ -190,9 +190,28 @@ async def on_chat_start():
             await cl.Message(content="No documents found to build index.").send()
             return
 
-    retriever = index.as_retriever(
-        similarity_top_k=int(retriever_config.get("similarity_top_k", 8))
+    # --- Create Fusion Retriever ---
+    all_nodes = list(index.docstore.docs.values())
+    
+    vector_retriever = VectorIndexRetriever(
+        index=index,
+        similarity_top_k=int(retriever_config.get("similarity_top_k", 10))
     )
+    bm25_retriever = BM25Retriever.from_defaults(
+        nodes=all_nodes,
+        similarity_top_k=int(retriever_config.get("similarity_top_k", 10))
+    )
+    
+    # --- FIXED: Use QueryFusionRetriever ---
+    retriever = QueryFusionRetriever(
+        retrievers=[vector_retriever, bm25_retriever],
+        similarity_top_k=int(retriever_config.get("similarity_top_k", 10)),
+        num_queries=1,  # We disable query generation since we have our own rewriter
+        mode="reciprocal_rerank",
+        use_async=True,
+        llm=None,
+    )
+    print("Query Fusion Retriever created.")
 
     cl.user_session.set("rewrite_llm", rewrite_llm)
     cl.user_session.set("answer_llm", answer_llm)
@@ -221,8 +240,8 @@ async def on_message(message: cl.Message):
 
     rewritten_query = rewrite_query_sync(rewrite_llm, llama_history, message.content, product_description)
     
-    retrieved_nodes = retriever.retrieve(rewritten_query)
-    log_retrieved_chunks(retrieved_nodes, message.content, rewritten_query, stage="Retrieved")
+    retrieved_nodes = await retriever.aretrieve(rewritten_query)
+    log_retrieved_chunks(retrieved_nodes, message.content, rewritten_query, stage="Fused")
     
     final_nodes = retrieved_nodes
     for postprocessor in postprocessors:
@@ -241,13 +260,9 @@ async def on_message(message: cl.Message):
     msg.content = response.text
     await msg.update()
 
-    # --- REMOVED: Source display and follow-up questions logic ---
-
     cl_messages.append(cl.Message(author="user", content=message.content))
     cl_messages.append(cl.Message(author="assistant", content=response.text))
     cl.user_session.set("chat_history", cl_messages)
-
-# --- REMOVED: Action callback is no longer needed ---
 
 # --- Terminal Chat Mode Logic ---
 def run_terminal_chat():
