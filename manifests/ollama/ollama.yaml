@@ -1,0 +1,68 @@
+# ollama-deployment.yaml
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: ollama
+  namespace: acm-observability-assistant-ns
+  labels:
+    app: ollama
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: ollama
+  serviceName: "ollama-service"
+  template:
+    metadata:
+      labels:
+        app: ollama
+    spec:
+      # --- NEW: Add an Init Container to pre-pull models ---
+      initContainers:
+      - name: ollama-model-puller
+        image: ollama/ollama # Use the same image
+        command: ["/bin/sh", "-c"]
+        args:
+        - |
+          echo "Starting model pull..."
+          ollama serve &
+          PID=$!
+          sleep 5
+          echo "Pulling embedding model..."
+          ollama pull nomic-embed-text
+          echo "Model pull complete."
+          kill $PID
+        volumeMounts:
+        - name: ollama-storage
+          mountPath: /root/.ollama
+      # --- Main application container ---
+      containers:
+      - name: ollama
+        image: ollama/ollama
+        ports:
+        - containerPort: 11434
+        volumeMounts:
+        - name: ollama-storage
+          mountPath: /root/.ollama
+  volumeClaimTemplates:
+  - metadata:
+      name: ollama-storage
+    spec:
+      accessModes: [ "ReadWriteOnce" ]
+      resources:
+        requests:
+          storage: 20Gi # Adjust as needed
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ollama-service
+  namespace: acm-observability-assistant-ns
+  labels:
+    app: ollama
+spec:
+  ports:
+  - port: 11434
+    targetPort: 11434
+  selector:
+    app: ollama

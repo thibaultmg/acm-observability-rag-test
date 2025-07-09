@@ -29,7 +29,6 @@ from llama_index.core.node_parser import SemanticSplitterNodeParser, MarkdownNod
 from llama_index.core.schema import TextNode, NodeWithScore
 from llama_index.embeddings.ollama import OllamaEmbedding
 from llama_index.core.postprocessor import SentenceTransformerRerank, SimilarityPostprocessor
-# --- FIXED: Corrected import path for FusionRetriever ---
 from llama_index.core.retrievers import VectorIndexRetriever, QueryFusionRetriever
 from llama_index.retrievers.bm25 import BM25Retriever
 
@@ -99,6 +98,22 @@ Do not answer the question. Only provide the rephrased, standalone question.
 <Standalone Question>
 """
 
+# --- NEW: Prompt for the faithfulness check ---
+FAITHFULNESS_PROMPT_TMPL = """Given the following context and an answer, you must determine if the answer is fully supported by the context.
+The answer must not contain any information that is not explicitly mentioned in the context.
+Respond with only the word "YES" if the answer is faithful to the context, and "NO" otherwise.
+
+<Context>
+{context_str}
+</Context>
+
+<Answer>
+{answer}
+</Answer>
+
+Is the answer supported by the context?
+"""
+
 def format_history(chat_history: List[LlamaChatMessage]) -> str:
     if not chat_history: return "No history yet."
     return "\n".join([f"{msg.role.capitalize()}: {msg.content}" for msg in chat_history])
@@ -110,6 +125,15 @@ def rewrite_query_sync(llm: CustomLLM, chat_history: List[LlamaChatMessage], que
     rewritten_query = response.text.strip()
     print(f"Original query: '{question}' -> Rewritten query: '{rewritten_query}'")
     return rewritten_query
+
+# --- NEW: Function to perform the faithfulness check ---
+def check_faithfulness_sync(llm: CustomLLM, context: str, answer: str) -> bool:
+    """Checks if the answer is supported by the context."""
+    prompt = FAITHFULNESS_PROMPT_TMPL.format(context_str=context, answer=answer)
+    response = llm.complete(prompt)
+    result = response.text.strip().upper()
+    print(f"Faithfulness check result: {result}")
+    return "YES" in result
 
 # --- Configuration Loading ---
 def load_config():
@@ -145,6 +169,8 @@ async def on_chat_start():
         model_name=embedding_config.get("model_name", "nomic-embed-text"),
         base_url=embedding_config.get("ollama_host")
     )
+    
+    Settings.llm = None
     
     reranker = SentenceTransformerRerank(
         model="BAAI/bge-reranker-base", top_n=int(retriever_config.get("rerank_top_n", 5))
@@ -190,27 +216,10 @@ async def on_chat_start():
             await cl.Message(content="No documents found to build index.").send()
             return
 
-    # --- Create Fusion Retriever ---
     all_nodes = list(index.docstore.docs.values())
-    
-    vector_retriever = VectorIndexRetriever(
-        index=index,
-        similarity_top_k=int(retriever_config.get("similarity_top_k", 10))
-    )
-    bm25_retriever = BM25Retriever.from_defaults(
-        nodes=all_nodes,
-        similarity_top_k=int(retriever_config.get("similarity_top_k", 10))
-    )
-    
-    # --- FIXED: Use QueryFusionRetriever ---
-    retriever = QueryFusionRetriever(
-        retrievers=[vector_retriever, bm25_retriever],
-        similarity_top_k=int(retriever_config.get("similarity_top_k", 10)),
-        num_queries=1,  # We disable query generation since we have our own rewriter
-        mode="reciprocal_rerank",
-        use_async=True,
-        llm=None,
-    )
+    vector_retriever = VectorIndexRetriever(index=index, similarity_top_k=int(retriever_config.get("similarity_top_k", 10)))
+    bm25_retriever = BM25Retriever.from_defaults(nodes=all_nodes, similarity_top_k=int(retriever_config.get("similarity_top_k", 10)))
+    retriever = QueryFusionRetriever(retrievers=[vector_retriever, bm25_retriever], similarity_top_k=int(retriever_config.get("similarity_top_k", 10)), num_queries=1, mode="reciprocal_rerank", use_async=True)
     print("Query Fusion Retriever created.")
 
     cl.user_session.set("rewrite_llm", rewrite_llm)
@@ -220,6 +229,7 @@ async def on_chat_start():
     cl.user_session.set("system_prompt", system_prompt)
     cl.user_session.set("product_description", product_description)
     cl.user_session.set("chat_history", [])
+    cl.user_session.set("enable_faithfulness_check", llm_config.get("enable_faithfulness_check", False))
 
     await cl.Message(content="ACM Observability Expert is ready. How can I help you?").send()
 
@@ -232,6 +242,7 @@ async def on_message(message: cl.Message):
     system_prompt = cl.user_session.get("system_prompt")
     product_description = cl.user_session.get("product_description")
     cl_messages = cl.user_session.get("chat_history")
+    enable_faithfulness_check = cl.user_session.get("enable_faithfulness_check")
     
     llama_history = [LlamaChatMessage(role=m.author, content=m.content) for m in cl_messages]
 
@@ -256,12 +267,19 @@ async def on_message(message: cl.Message):
     ]
     
     response = answer_llm.chat(final_messages)
+    final_answer = response.text
     
-    msg.content = response.text
+    # --- NEW: Perform faithfulness check if enabled ---
+    if enable_faithfulness_check:
+        is_faithful = check_faithfulness_sync(rewrite_llm, context_str, final_answer)
+        if not is_faithful:
+            final_answer += "\n\n> *Warning: This answer may contain information not present in the source documents.*"
+
+    msg.content = final_answer
     await msg.update()
 
     cl_messages.append(cl.Message(author="user", content=message.content))
-    cl_messages.append(cl.Message(author="assistant", content=response.text))
+    cl_messages.append(cl.Message(author="assistant", content=final_answer))
     cl.user_session.set("chat_history", cl_messages)
 
 # --- Terminal Chat Mode Logic ---

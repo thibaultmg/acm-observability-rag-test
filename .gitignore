@@ -195,3 +195,5 @@ cython_debug/
 
 data/
 storage/
+open-webui-data/
+.chainlit/
