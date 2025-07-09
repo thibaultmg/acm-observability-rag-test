@@ -189,7 +189,8 @@ async def on_chat_start():
     except FileNotFoundError: product_description = "No product description provided."
 
     DATA_DIR, PERSIST_DIR = "./data", "./storage"
-    if os.path.exists(PERSIST_DIR):
+    if os.path.exists(PERSIST_DIR) and os.path.exists(os.path.join(PERSIST_DIR, "docstore.json")):
+        print(f"Loading existing index from {PERSIST_DIR}...")
         storage_context = StorageContext.from_defaults(persist_dir=PERSIST_DIR)
         index = load_index_from_storage(storage_context, embed_model=embed_model)
     else:

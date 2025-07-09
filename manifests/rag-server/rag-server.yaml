@@ -22,6 +22,14 @@ data:
       model_name: "nomic-embed-text"
       ollama_host: "http://localhost:11434"
 ---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  annotations:
+    serviceaccounts.openshift.io/oauth-redirectreference.grafana: '{"kind":"OAuthRedirectReference","apiVersion":"v1","reference":{"kind":"Route","name":"acm-observability-assistant-route"}}'
+  name: acm-observability-assistant-sa
+  namespace: acm-observability-assistant-ns
+---
 # ---
 # Note: Create this secret before applying the manifest.
 # oc create secret generic litellm-api-keys -n acm-observability-assistant-ns --from-literal=GOOGLE_API_KEY='...'
@@ -44,16 +52,14 @@ spec:
       labels:
         app: acm-observability-assistant
     spec:
+      serviceAccountName: acm-observability-assistant-sa
       containers:
       - name: acm-observability-assistant
         image: quay.io/rh-ee-tmange/acm-observability-expert:latest
-        ports:
-        - containerPort: 8000
         command: ["chainlit", "run", "main.py", "--host", "0.0.0.0", "--port", "8000", "-w"]
         volumeMounts:
         - name: rag-storage
           mountPath: /app/storage
-        # --- NEW: Mount for the persistent model cache ---
         - name: model-cache
           mountPath: /app/.cache
         - name: config-volume
@@ -71,6 +77,18 @@ spec:
               name: litellm-api-keys
               key: GEMINI_API_KEY
               optional: true
+      - name: oauth-proxy
+        image: quay.io/stolostron/origin-oauth-proxy:4.16
+        args:
+        - --provider=openshift
+        - --openshift-service-account=acm-observability-assistant-sa
+        - --upstream=http://localhost:8000 # Forwards to your app container on port 8080
+        - --http-address=:8001 # The proxy listens on this port
+        - --https-address= # only listen http
+        - --cookie-secret=thisisasecret # Change this!
+        ports:
+        - containerPort: 8001
+          name: oauth-proxy
       volumes:
       - name: config-volume
         configMap:
@@ -83,7 +101,6 @@ spec:
       resources:
         requests:
           storage: 5Gi
-  # --- NEW: Define the persistent volume claim for the model cache ---
   - metadata:
       name: model-cache
     spec:
@@ -95,12 +112,12 @@ spec:
 apiVersion: v1
 kind: Service
 metadata:
-  name: acm-observability-assistant-service
+  name: acm-observability-assistant-proxy-service
   namespace: acm-observability-assistant-ns
 spec:
   ports:
-  - port: 8000
-    targetPort: 8000
+  - port: 443
+    targetPort: 8001
   selector:
     app: acm-observability-assistant
 ---
@@ -112,9 +129,20 @@ metadata:
 spec:
   to:
     kind: Service
-    name: acm-observability-assistant-service
-  port:
-    targetPort: 8000
+    name: acm-observability-assistant-proxy-service
   subdomain: acm-observability-assistant
   tls:
     termination: edge
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: acm-observability-assistant-proxy-binding
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: system:auth-delegator # A default role that allows for token reviews
+subjects:
+- kind: ServiceAccount
+  name: acm-observability-assistant-sa
+  namespace: acm-observability-assistant-ns
