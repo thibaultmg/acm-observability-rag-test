@@ -26,6 +26,7 @@ COPY system_prompt.txt .
 COPY product_description.txt .
 # COPY ./storage/ ./storage/
 COPY ./data/ ./data/
+COPY ./.chainlit/ ./.chainlit/
 
 # This is necessary for OpenShift's random user security model.
 # It allows Chainlit to create its '.files' directory at runtime.

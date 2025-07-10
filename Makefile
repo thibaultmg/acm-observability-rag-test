@@ -73,6 +73,11 @@ else
 	docker buildx build -f ollama.Dockerfile --platform $(PLATFORMS) -t $(OLLAMA_IMAGE) --push .
 endif
 
+.PHONY: delete-pvcs
+delete-pvcs:
+	oc delete pvc model-cache-acm-observability-assistant-0 -n acm-observability-assistant-ns --grace-period=0 --force
+	oc delete pvc rag-storage-acm-observability-assistant-0 -n acm-observability-assistant-ns --grace-period=0 --force
+
 # ==============================================================================
 # Local Development & Testing
 # ==============================================================================
